@@ -1,71 +1,107 @@
-"""DroidPerf's local Flask server and Server-Sent Events API."""
-from __future__ import annotations
-import json, queue, threading, uuid
-from pathlib import Path
-from statistics import mean
-from typing import Any
-from flask import Flask, Response, jsonify, request, send_from_directory, stream_with_context
-from collector import GPU_CLOCK_PATHS, SessionCollector, _clock, detect_foreground_app, run_adb
+"""DroidPerf application extensions.
 
-ROOT, SESSION_DIR = Path(__file__).resolve().parent, Path(__file__).resolve().parent / "sessions"
-app = Flask(__name__); active: dict[str, dict[str, Any]] = {}
+The existing Flask/NIM application lives in :mod:`app_core`; this module adds
+device status and exports. The aggregate function in app_core already includes
+FPS stability, RAM in MB, and battery temp alias.
+"""
+import csv
+import io
+import json
 
-def aggregate(c: SessionCollector) -> dict[str, Any]:
-    def values(key): return [s[key] for s in c.samples if s.get(key) is not None]
-    fps, low1, low10, ram, temp = values("fps"), values("low_1_percent_fps"), values("low_10_percent_fps"), values("ram_pss_kb"), values("battery_temperature_c")
-    return {"sample_count": len(c.samples), "avg_fps": mean(fps) if fps else None, "low_1_percent_fps": mean(low1) if low1 else None, "low_10_percent_fps": mean(low10) if low10 else None, "max_fps": max(values("max_fps"), default=None), "peak_ram_pss_kb": max(ram, default=None), "average_ram_pss_kb": mean(ram) if ram else None, "battery_temperature_c": temp[-1] if temp else None, "peak_battery_temperature_c": max(temp, default=None), "cpu_clock_min_mhz": min(c.cpu_extremes, default=None), "cpu_clock_max_mhz": max(c.cpu_extremes, default=None), "gpu_clock_min_mhz": min(c.gpu_extremes, default=None), "gpu_clock_max_mhz": max(c.gpu_extremes, default=None)}
+from flask import Response, jsonify
 
-def fallback_report(): return {"verdict":"Raw performance statistics are available. AI analysis is not configured yet.","bottleneck":"stable","bottleneck_explanation":"Configure NIM_API_KEY for narrative analysis.","stutter_events":[],"recommendations":["Review the FPS lows and frame-time variance in the chart."],"available":False}
+import app_core
+from app_core import aggregate
 
-def finish(session_id: str):
-    state = active[session_id]; data = state["collector"].session_data(); data["session_id"] = session_id; data["aggregates"] = aggregate(state["collector"]); data["report"] = fallback_report(); SESSION_DIR.mkdir(exist_ok=True); (SESSION_DIR / f"{session_id}.json").write_text(json.dumps(data, indent=2), encoding="utf-8"); state["data"], state["done"] = data, True; state["events"].put(None)
+app = app_core.app
 
-@app.get("/")
-def index(): return send_from_directory(ROOT, "index.html")
-@app.get("/gpu-support")
-def gpu_support():
-    for path in GPU_CLOCK_PATHS:
-        if _clock(run_adb(["shell", "cat", path])) is not None: return jsonify({"gpu_supported":True,"path":path})
-    return jsonify({"gpu_supported":False,"path":None})
-@app.get("/detect-app")
-def detect_app(): return jsonify({"package_name":detect_foreground_app()})
-@app.post("/start")
-def start():
-    body = request.get_json(silent=True) or {}; session_id = uuid.uuid4().hex; state = {"events":queue.Queue(),"stop":threading.Event(),"done":False,"data":None,"collector":SessionCollector((body.get("package_name") or "").strip() or None, output_dir=SESSION_DIR)}; active[session_id] = state
-    def worker():
-        try: state["collector"].run(state["stop"], state["events"].put)
-        finally: finish(session_id)
-    threading.Thread(target=worker, daemon=True).start(); return jsonify({"session_id":session_id})
-@app.get("/stream/<session_id>")
-def stream(session_id: str):
-    state = active.get(session_id)
-    if not state: return jsonify({"error":"unknown session"}), 404
-    @stream_with_context
-    def generate():
-        while True:
-            item = state["events"].get()
-            if item is None: yield "event: done\ndata: {}\n\n"; return
-            yield f"data: {json.dumps(item)}\n\n"
-    return Response(generate(), mimetype="text/event-stream", headers={"Cache-Control":"no-cache"})
-@app.post("/stop/<session_id>")
-def stop(session_id: str):
-    state = active.get(session_id)
-    if not state: return jsonify({"error":"unknown session"}),404
-    state["stop"].set()
-    while not state["done"]: threading.Event().wait(.02)
-    return jsonify(state["data"])
-@app.get("/sessions")
-def sessions():
-    result=[]
-    if SESSION_DIR.exists():
-        for path in sorted(SESSION_DIR.glob("*.json"),key=lambda p:p.stat().st_mtime,reverse=True):
-            try:
-                data=json.loads(path.read_text(encoding="utf-8")); result.append({"session_id":data.get("session_id",path.stem),"created_at":data.get("created_at"),"package_name":data.get("package_name"),"avg_fps":data.get("aggregates",{}).get("avg_fps")})
-            except (OSError,json.JSONDecodeError): pass
-    return jsonify(result)
-@app.get("/sessions/<session_id>")
-def saved_session(session_id: str):
-    path=SESSION_DIR/f"{session_id}.json"
-    if not path.exists(): return jsonify({"error":"session not found"}),404
-    return jsonify(json.loads(path.read_text(encoding="utf-8")))
-if __name__ == "__main__": app.run(host="127.0.0.1",port=5000,threaded=True)
+
+def _session_path(session_id):
+    re_pattern = getattr(app_core, "SESSION_ID_RE", getattr(app_core, "_VALID_ID", None))
+    if not re_pattern or not re_pattern.fullmatch(session_id):
+        return None
+    path = app_core.SESSION_DIR / f"{session_id}.json"
+    return path if path.is_file() else None
+
+
+def _unavailable(value):
+    return "Measurement unavailable" if value is None else value
+
+
+@app.get("/connection")
+def connection_status():
+    """Return the current ADB connection state for the UI."""
+    try:
+        output = app_core.run_adb(["devices"], timeout=3.0) or ""
+    except Exception as exc:
+        return jsonify({"connected": False, "state": "error", "message": str(exc)})
+    rows = []
+    for line in output.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 2:
+            rows.append({"serial": parts[0], "state": parts[1]})
+    connected = any(row["state"] == "device" for row in rows)
+    state = "device" if connected else (rows[0]["state"] if rows else "disconnected")
+    return jsonify({
+        "connected": connected,
+        "state": state,
+        "devices": rows,
+        "message": "ADB connected" if connected else "No usable ADB device",
+    })
+
+
+@app.get("/sessions/<session_id>/export.json")
+def export_json(session_id):
+    path = _session_path(session_id)
+    if path is None:
+        return jsonify({"error": "session not found"}), 404
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return Response(
+        json.dumps(payload, indent=2),
+        mimetype="application/json",
+        headers={"Content-Disposition": f"attachment; filename={session_id}.json"},
+    )
+
+
+@app.get("/sessions/<session_id>/export.csv")
+def export_csv(session_id):
+    path = _session_path(session_id)
+    if path is None:
+        return jsonify({"error": "session not found"}), 404
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    samples = payload.get("samples", [])
+    fields = sorted({key for sample in samples for key in sample})
+    stream = io.StringIO()
+    if fields:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for sample in samples:
+            writer.writerow({
+                key: _unavailable(json.dumps(sample[key]) if isinstance(sample.get(key), (dict, list)) else sample.get(key))
+                for key in fields
+            })
+    else:
+        stream.write("Measurement unavailable\n")
+    return Response(
+        stream.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={session_id}.csv"},
+    )
+
+
+if __name__ == "__main__":
+    import logging
+    import os
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    )
+    port = int(os.environ.get("PORT", "5000"))
+    print(f"Starting DroidPerf at http://127.0.0.1:{port}")
+    app.run(
+        host="127.0.0.1",
+        port=port,
+        threaded=True,
+        use_reloader=False,
+    )
+

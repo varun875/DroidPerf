@@ -1,11 +1,13 @@
 """Fail-soft Android performance metric collector used by DroidPerf."""
 from __future__ import annotations
-import argparse, json, math, re, subprocess, threading, time, uuid
+import argparse, json, logging, math, re, subprocess, threading, time, uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean, pstdev
 from typing import Any, Callable, Iterable, Optional
+
+logger = logging.getLogger("droidperf.collector")
 
 GPU_CLOCK_PATHS = ("/sys/class/kgsl/kgsl-3d0/gpuclk", "/sys/kernel/gpu/gpu_clock")
 ROLLING_FRAME_WINDOW = 120
@@ -17,8 +19,15 @@ def _number(value: str) -> Optional[float]:
 def run_adb(args: Iterable[str], timeout: float = 5.0) -> str:
     try:
         result = subprocess.run(["adb", *args], capture_output=True, text=True, timeout=timeout, check=False)
+        if result.returncode != 0 and result.stderr:
+            logger.debug("adb %s failed (rc=%d): %s", " ".join(args), result.returncode, result.stderr.strip())
         return result.stdout or ""
-    except (OSError, subprocess.SubprocessError): return ""
+    except subprocess.TimeoutExpired:
+        logger.debug("adb %s timed out after %.1fs", " ".join(args), timeout)
+        return ""
+    except OSError as exc:
+        logger.debug("adb %s error: %s", " ".join(args), exc)
+        return ""
 
 def parse_foreground_app(output: str) -> Optional[str]:
     for line in output.splitlines():
@@ -104,6 +113,34 @@ def _clock(value: str) -> Optional[float]:
     number = _number(value)
     return number/1000 if number is not None else None
 
+
+def _batch_read(runner: Callable[[Iterable[str], float], str], commands: list[str], timeout: float = 5.0) -> list[str]:
+    """Run multiple shell commands in a single adb call, return their outputs."""
+    if not commands:
+        return []
+    parts: list[str] = []
+    for i, cmd in enumerate(commands):
+        parts.append(f'echo "===DROIDPERF_{i}==="')
+        parts.append(cmd)
+    combined = "; ".join(parts)
+    output = runner(["shell", combined], timeout=timeout)
+    results: list[str] = []
+    for i in range(len(commands)):
+        marker = f"===DROIDPERF_{i}==="
+        start = output.find(marker)
+        if start == -1:
+            results.append("")
+            continue
+        start = output.find("\n", start) + 1
+        next_marker = f"===DROIDPERF_{i + 1}===" if i + 1 < len(commands) else None
+        if next_marker and next_marker in output[start:]:
+            end = output.find(next_marker, start)
+            results.append(output[start:end].strip())
+        else:
+            results.append(output[start:].strip())
+    return results
+
+
 @dataclass
 class SessionCollector:
     package_name: Optional[str] = None; interval: float = 1.; output_dir: Path = Path("sessions")
@@ -124,12 +161,57 @@ class SessionCollector:
         render_times, intervals = parse_frame_times(gfx)[-ROLLING_FRAME_WINDOW:], parse_frame_intervals(gfx)[-ROLLING_FRAME_WINDOW:]
         metrics, render = frame_metrics(intervals), frame_metrics(render_times)
         metrics["frame_time_stddev_ms"], metrics["frame_time_variance_ms2"], metrics["avg_render_time_ms"] = render["frame_time_stddev_ms"], render["frame_time_variance_ms2"], mean(render_times) if render_times else None
-        clocks = {path.split("/")[-3]: _clock(self.runner(["shell", "cat", path])) for path in self.cpu_paths}; current = [x for x in clocks.values() if x is not None]; self.cpu_extremes.extend(current)
-        gpu = _clock(self.runner(["shell", "cat", self.gpu_path])) if self.gpu_path else None
-        if gpu is not None: self.gpu_extremes.append(gpu)
-        load, self._previous_cpu = parse_cpu_load(self._previous_cpu, self.runner(["shell", "cat", "/proc/stat"])); battery = parse_battery(self.runner(["shell", "dumpsys", "battery"]))
-        sample = {"timestamp": datetime.now(timezone.utc).isoformat(), "package_name": package, **metrics, "cpu_clocks_mhz": clocks, "cpu_avg_clock_mhz": mean(current) if current else None, "cpu_load_percent": load, "gpu_clock_mhz": gpu, "gpu_supported": self.gpu_path is not None, "ram_pss_kb": parse_pss_total(self.runner(["shell", "dumpsys", "meminfo", package])) if package else None, **battery, "thermal": parse_thermal(self.runner(["shell", "dumpsys", "thermalservice"]))}
-        self.samples.append(sample); return sample
+
+        # Batch all system reads into a single ADB call
+        all_cmds: list[str] = [f"cat {path}" for path in self.cpu_paths]
+        gpu_idx = len(all_cmds) if self.gpu_path else None
+        if self.gpu_path:
+            all_cmds.append(f"cat {self.gpu_path}")
+        stat_idx = len(all_cmds)
+        all_cmds.append("cat /proc/stat")
+        battery_idx = len(all_cmds)
+        all_cmds.append("dumpsys battery")
+        meminfo_idx = len(all_cmds) if package else None
+        if package:
+            all_cmds.append(f"dumpsys meminfo {package}")
+        thermal_idx = len(all_cmds)
+        all_cmds.append("dumpsys thermalservice")
+
+        outputs = _batch_read(self.runner, all_cmds)
+        # Pad with empty strings if device disconnected mid-batch
+        while len(outputs) < len(all_cmds):
+            outputs.append("")
+
+        clocks: dict[str, Optional[float]] = {}
+        for i, path in enumerate(self.cpu_paths):
+            clocks[path.split("/")[-3]] = _clock(outputs[i])
+        current = [x for x in clocks.values() if x is not None]
+        self.cpu_extremes.extend(current)
+
+        gpu = _clock(outputs[gpu_idx]) if gpu_idx is not None else None
+        if gpu is not None:
+            self.gpu_extremes.append(gpu)
+
+        load, self._previous_cpu = parse_cpu_load(self._previous_cpu, outputs[stat_idx])
+        battery = parse_battery(outputs[battery_idx])
+        ram = parse_pss_total(outputs[meminfo_idx]) if meminfo_idx is not None else None
+        thermal = parse_thermal(outputs[thermal_idx])
+
+        sample = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "package_name": package,
+            **metrics,
+            "cpu_clocks_mhz": clocks,
+            "cpu_avg_clock_mhz": mean(current) if current else None,
+            "cpu_load_percent": load,
+            "gpu_clock_mhz": gpu,
+            "gpu_supported": self.gpu_path is not None,
+            "ram_pss_kb": ram,
+            **battery,
+            "thermal": thermal,
+        }
+        self.samples.append(sample)
+        return sample
 
     def run(self, stop_event: Optional[threading.Event] = None, on_sample: Optional[Callable[[dict[str, Any]], None]] = None, duration: Optional[float] = None) -> list[dict[str, Any]]:
         self.prepare(); start = time.monotonic(); stop_event = stop_event or threading.Event()
@@ -137,12 +219,14 @@ class SessionCollector:
             try:
                 sample = self.poll_once()
                 if on_sample: on_sample(sample)
-            except Exception: pass
+            except Exception:
+                logger.debug("poll_once failed", exc_info=True)
             stop_event.wait(self.interval)
         return self.samples
 
     def session_data(self) -> dict[str, Any]:
-        values = lambda key: [s[key] for s in self.samples if s.get(key) is not None]
+        def values(key: str) -> list[Any]:
+            return [s[key] for s in self.samples if s.get(key) is not None]
         levels, ram, temps = values("battery_level_percent"), values("ram_pss_kb"), values("battery_temperature_c")
         return {"session_id": uuid.uuid4().hex, "created_at": datetime.now(timezone.utc).isoformat(), "package_name": self.package_name, "gpu_supported": self.gpu_path is not None, "battery_start_percent": levels[0] if levels else None, "battery_end_percent": levels[-1] if levels else None, "battery_drop_percent": levels[0]-levels[-1] if len(levels)>1 else None, "peak_battery_temperature_c": max(temps, default=None), "peak_ram_pss_kb": max(ram, default=None), "cpu_clock_min_mhz": min(self.cpu_extremes, default=None), "cpu_clock_max_mhz": max(self.cpu_extremes, default=None), "gpu_clock_min_mhz": min(self.gpu_extremes, default=None), "gpu_clock_max_mhz": max(self.gpu_extremes, default=None), "samples": self.samples}
 

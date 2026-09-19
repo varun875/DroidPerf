@@ -18,3 +18,19 @@ def test_other_parsers():
     assert parse_battery("level: 87\ntemperature: 365") == {"battery_level_percent": 87.0, "battery_temperature_c": 36.5}
     assert parse_thermal("CPU temp: 72000") == [{"zone": "CPU", "temperature_c": 72.0}]
     assert frame_metrics([])["fps"] is None
+
+def test_aggregate_fallback():
+    from app import aggregate
+    class DummyCollector:
+        samples = [{"fps": 60.0, "low_1_percent_fps": None}, {"fps": 30.0, "low_1_percent_fps": None}]
+        cpu_extremes = []
+        gpu_extremes = []
+    aggs = aggregate(DummyCollector())
+    assert aggs["avg_fps"] == 45.0
+    assert aggs["low_1_percent_fps"] == 30.0
+
+def test_generate_report():
+    from analysis import generate_report
+    report = generate_report({})
+    assert "verdict" in report
+    assert "bottleneck" in report
