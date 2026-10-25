@@ -206,6 +206,7 @@ class SessionCollector(_BaseSessionCollector):
                 fps, source = gfx, "gfxinfo_frame_counter"
 
         sample["fps_source"] = source
+        sample.setdefault("metric_status", {})["fps"] = "available" if fps is not None else "unavailable"
         self._apply_fps(sample, fps)
         return sample
 

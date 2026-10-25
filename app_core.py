@@ -220,10 +220,30 @@ def aggregate(collector: SessionCollector) -> dict[str, Any]:
     low1_vals = vals("low_1_percent_fps")
     low10_vals = vals("low_10_percent_fps")
 
+    # New sessions retain each newly observed frame interval exactly once.
+    # Compute lows from per-frame FPS values, not from periodic FPS samples or
+    # overlapping per-poll rolling windows. Require enough observations for a
+    # 1% tail to represent at least one frame out of 100.
+    has_frame_timing = any("frame_intervals_ms" in sample for sample in samples)
+    frame_intervals = [
+        float(interval)
+        for sample in samples
+        for interval in (sample.get("frame_intervals_ms") or [])
+        if isinstance(interval, (int, float)) and interval > 0
+    ]
+    frame_fps = sorted(1000.0 / interval for interval in frame_intervals)
+
     avg_fps = mean(fps) if fps else None
-    # Per-sample lows are preferred when present; otherwise derive from fps.
-    low1 = mean(low1_vals) if low1_vals else percentile_mean(fps, 0.01)
-    low10 = mean(low10_vals) if low10_vals else percentile_mean(fps, 0.10)
+    if has_frame_timing:
+        low1 = mean(frame_fps[:max(1, math.ceil(len(frame_fps) * 0.01))]) if len(frame_fps) >= 100 else None
+        low10 = mean(frame_fps[:max(1, math.ceil(len(frame_fps) * 0.10))]) if len(frame_fps) >= 10 else None
+        low_method = "frame_intervals" if frame_intervals else "unavailable"
+    else:
+        # Old saved sessions do not contain frame intervals; retain their
+        # sampled-FPS estimate and label its lower confidence explicitly.
+        low1 = mean(low1_vals) if low1_vals else percentile_mean(fps, 0.01)
+        low10 = mean(low10_vals) if low10_vals else percentile_mean(fps, 0.10)
+        low_method = "sampled_fps_legacy" if fps else "unavailable"
     # The adapter reports an instantaneous rate, so per-sample max is usually
     # absent — fall back to the observed ceiling of the fps series (honest),
     # never to the average.
@@ -236,11 +256,24 @@ def aggregate(collector: SessionCollector) -> dict[str, Any]:
     ram_mbs = [s["ram_mb"] for s in samples if s.get("ram_mb") is not None]
     temps_c = [s["battery_temp_c"] for s in samples if s.get("battery_temp_c") is not None]
 
+    metric_names = ("fps", "cpu_clock", "gpu_clock", "ram_pss", "battery_temperature", "thermal")
+    metric_status: dict[str, str] = {}
+    for name in metric_names:
+        observed = [s.get("metric_status", {}).get(name) for s in samples]
+        if "available" in observed:
+            metric_status[name] = "available"
+        elif observed and all(status == "unsupported" for status in observed):
+            metric_status[name] = "unsupported"
+        else:
+            metric_status[name] = "unavailable"
+
     result = {
         "sample_count": len(samples),
         "avg_fps": avg_fps,
         "low_1_percent_fps": low1,
         "low_10_percent_fps": low10,
+        "low_fps_method": low_method,
+        "frame_interval_count": len(frame_intervals),
         "max_fps": max_fps,
         "peak_ram_pss_kb": max(ram, default=None),
         "average_ram_pss_kb": mean(ram) if ram else None,
@@ -253,6 +286,7 @@ def aggregate(collector: SessionCollector) -> dict[str, Any]:
         "fps_stability_score": _stability_score(samples),
         "peak_ram_mb": max(ram_mbs) if ram_mbs else (round(max(ram) / 1024, 2) if ram else None),
         "battery_temp_c": temps_c[-1] if temps_c else (temp[-1] if temp else None),
+        "metric_status": metric_status,
     }
     return result
 
@@ -472,9 +506,25 @@ def saved_session(session_id: str):
 
     data = json.loads(path.read_text(encoding="utf-8"))
     aggs = data.get("aggregates", {})
+    samples = data.get("samples", [])
 
     # Backfill percentile/max for files written before those fields existed.
-    if aggs.get("low_1_percent_fps") is None and data.get("samples"):
+    has_frame_timing = any("frame_intervals_ms" in sample for sample in samples)
+    if "low_fps_method" not in aggs:
+        if has_frame_timing:
+            aggs["low_fps_method"] = "frame_intervals" if any(s.get("frame_intervals_ms") for s in samples) else "unavailable"
+        else:
+            aggs["low_fps_method"] = "sampled_fps_legacy" if any(s.get("fps") is not None for s in samples) else "unavailable"
+    if "metric_status" not in aggs:
+        aggs["metric_status"] = {
+            "fps": "available" if any(s.get("fps") is not None for s in samples) else "unavailable",
+            "cpu_clock": "available" if any(s.get("cpu_avg_clock_mhz") is not None for s in samples) else "unavailable",
+            "gpu_clock": "available" if any(s.get("gpu_clock_mhz") is not None for s in samples) else ("unsupported" if samples and not data.get("gpu_supported") else "unavailable"),
+            "ram_pss": "available" if any(s.get("ram_pss_kb") is not None for s in samples) else "unavailable",
+            "battery_temperature": "available" if any(s.get("battery_temperature_c") is not None for s in samples) else "unavailable",
+            "thermal": "available" if any(s.get("thermal") for s in samples) else "unavailable",
+        }
+    if aggs.get("low_1_percent_fps") is None and data.get("samples") and not has_frame_timing:
         fps = [s["fps"] for s in data["samples"] if s.get("fps") is not None]
         if fps:
             aggs["low_1_percent_fps"] = percentile_mean(fps, 0.01)

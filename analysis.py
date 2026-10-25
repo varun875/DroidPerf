@@ -131,7 +131,13 @@ def generate_report(session_json: dict[str, Any]) -> dict[str, Any]:
     try:
         from openai import OpenAI
         client = OpenAI(api_key=api_key, base_url=base_url, timeout=30.0, max_retries=1)
-        context = {"package_name": session_json.get("package_name"), "aggregates": session_json.get("aggregates", {}), "samples": _downsample(session_json.get("samples", []))}
+        # Raw per-frame intervals are kept in session files for accurate
+        # percentile calculations, but add little value to the narrative model.
+        samples = [
+            {key: value for key, value in sample.items() if key != "frame_intervals_ms"}
+            for sample in session_json.get("samples", [])
+        ]
+        context = {"package_name": session_json.get("package_name"), "aggregates": session_json.get("aggregates", {}), "samples": _downsample(samples)}
         
         for model in models_to_try:
             try:

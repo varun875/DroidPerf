@@ -65,11 +65,7 @@ def parse_frame_times(output: str) -> list[float]:
     return [(done-start)/1_000_000 for start, done in _frame_rows(output) if .1 <= (done-start)/1_000_000 <= 10_000]
 
 def parse_frame_intervals(output: str) -> list[float]:
-    """Frame cadence in ms from consecutive IntendedVsync timestamps.
-
-    Android's gfxinfo data is cumulative.  The caller uses only its newest
-    window, avoiding a stale app-start history from dominating current FPS.
-    """
+    """Frame cadence in ms from consecutive IntendedVsync timestamps."""
     timestamps = [row[0] for row in _frame_rows(output)]
     return [(right-left)/1_000_000 for left, right in zip(timestamps, timestamps[1:]) if 1 <= (right-left)/1_000_000 <= 1_000]
 
@@ -147,8 +143,10 @@ class SessionCollector:
     runner: Callable[[Iterable[str], float], str] = run_adb
     samples: list[dict[str, Any]] = field(default_factory=list); gpu_path: Optional[str] = None
     cpu_paths: list[str] = field(default_factory=list); cpu_extremes: list[float] = field(default_factory=list); gpu_extremes: list[float] = field(default_factory=list); _previous_cpu: Optional[tuple[int, int]] = None
+    _last_frame_vsync_ns: Optional[float] = field(default=None, init=False, repr=False)
 
     def prepare(self) -> None:
+        self._last_frame_vsync_ns = None
         if not self.package_name: self.package_name = parse_foreground_app(self.runner(["shell", "dumpsys", "window"]))
         paths = self.runner(["shell", "ls", "/sys/devices/system/cpu"], timeout=5)
         self.cpu_paths = [f"/sys/devices/system/cpu/{core}/cpufreq/scaling_cur_freq" for core in re.findall(r"\bcpu\d+\b", paths)]
@@ -158,7 +156,25 @@ class SessionCollector:
     def poll_once(self) -> dict[str, Any]:
         package = self.package_name or parse_foreground_app(self.runner(["shell", "dumpsys", "window"]))
         gfx = self.runner(["shell", "dumpsys", "gfxinfo", package, "framestats"]) if package else ""
-        render_times, intervals = parse_frame_times(gfx)[-ROLLING_FRAME_WINDOW:], parse_frame_intervals(gfx)[-ROLLING_FRAME_WINDOW:]
+        rows = _frame_rows(gfx)
+        timestamps = [row[0] for row in rows]
+        if timestamps and self._last_frame_vsync_ns is not None and timestamps[-1] < self._last_frame_vsync_ns:
+            # gfxinfo was reset or its counter restarted; begin a new window.
+            self._last_frame_vsync_ns = None
+        if timestamps:
+            last_seen = self._last_frame_vsync_ns
+            frame_intervals = [
+                (right - left) / 1_000_000
+                for left, right in zip(timestamps, timestamps[1:])
+                if (last_seen is None or left >= last_seen)
+                and 1 <= (right - left) / 1_000_000 <= 1_000
+            ]
+            self._last_frame_vsync_ns = timestamps[-1]
+        else:
+            frame_intervals = []
+
+        render_times = parse_frame_times(gfx)[-ROLLING_FRAME_WINDOW:]
+        intervals = parse_frame_intervals(gfx)[-ROLLING_FRAME_WINDOW:]
         metrics, render = frame_metrics(intervals), frame_metrics(render_times)
         metrics["frame_time_stddev_ms"], metrics["frame_time_variance_ms2"], metrics["avg_render_time_ms"] = render["frame_time_stddev_ms"], render["frame_time_variance_ms2"], mean(render_times) if render_times else None
 
@@ -200,6 +216,9 @@ class SessionCollector:
         sample = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "package_name": package,
+            # New intervals only, so session aggregates count each rendered
+            # frame once instead of averaging overlapping rolling windows.
+            "frame_intervals_ms": frame_intervals,
             **metrics,
             "cpu_clocks_mhz": clocks,
             "cpu_avg_clock_mhz": mean(current) if current else None,
@@ -209,6 +228,13 @@ class SessionCollector:
             "ram_pss_kb": ram,
             **battery,
             "thermal": thermal,
+            "metric_status": {
+                "cpu_clock": "available" if current else ("unavailable" if self.cpu_paths else "unsupported"),
+                "gpu_clock": "available" if gpu is not None else ("unavailable" if self.gpu_path else "unsupported"),
+                "ram_pss": "available" if ram is not None else "unavailable",
+                "battery_temperature": "available" if battery["battery_temperature_c"] is not None else "unavailable",
+                "thermal": "available" if thermal else "unavailable",
+            },
         }
         self.samples.append(sample)
         return sample

@@ -6,10 +6,11 @@
 
 ## ✨ Key Features
 
-- **Live FPS & Frametime Profiling**: Tracks continuous FPS along with 1% and 10% low FPS calculations to identify micro-stutters.
+- **Live FPS & Frametime Profiling**: Tracks FPS plus frame-interval-based 1% and 10% lows when Android exposes frame stats. The 1% low is withheld until at least 100 frame intervals are captured; older sessions are labeled as sampled estimates.
 - **Hardware Telemetry**: Monitors CPU core clock speeds, GPU frequencies (where supported), RAM usage (PSS), and battery temperatures in real time.
 - **Automatic Foreground App Detection**: Automatically detects the active Android game or app window.
 - **Real-Time Web Dashboard**: Server-Sent Events (SSE) streaming web UI with interactive Chart.js graphs and session history management.
+- **Metric Availability**: The dashboard labels FPS, CPU/GPU clocks, RAM, and battery readings as available, unavailable, or unsupported where the device reports that distinction.
 
 ---
 

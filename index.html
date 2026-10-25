@@ -430,10 +430,10 @@ input:focus { border-color: var(--mint); }
         <span class="pill">Live</span>
       </div>
       <div id="stats" class="kpis">
-        <div class="kpi"><small>AVG FPS</small><strong id="stat-fps">—</strong></div>
-        <div class="kpi"><small>1% LOW</small><strong id="stat-low1">—</strong></div>
-        <div class="kpi"><small>PEAK RAM</small><strong id="stat-ram">—</strong></div>
-        <div class="kpi"><small>BATTERY TEMP</small><strong id="stat-temp">—</strong></div>
+        <div class="kpi"><small id="fps-label">AVG FPS</small><strong id="stat-fps">—</strong></div>
+        <div class="kpi"><small id="low1-label" title="Calculated from individual frame intervals once 100 frames are available.">1% LOW · FRAME</small><strong id="stat-low1">—</strong></div>
+        <div class="kpi"><small id="ram-label">PEAK RAM</small><strong id="stat-ram">—</strong></div>
+        <div class="kpi"><small id="temp-label">BATTERY TEMP</small><strong id="stat-temp">—</strong></div>
       </div>
     </aside>
 
@@ -471,11 +471,17 @@ const fmt = (v, s = '') => v == null || Number.isNaN(Number(v)) ? '—' : Number
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-let id = null, es = null, chart, samples = [];
+let id = null, es = null, chart, samples = [], frameFpsValues = [];
 let recording = false;   // single source of truth — never sniff button text
 
 function reset() {
   samples = [];
+  frameFpsValues = [];
+  $('low1-label').textContent = '1% LOW · FRAME';
+  $('low1-label').title = 'Live estimate uses recent individual frame intervals once 100 frames are available.';
+  $('fps-label').textContent = 'AVG FPS';
+  $('ram-label').textContent = 'PEAK RAM';
+  $('temp-label').textContent = 'BATTERY TEMP';
   chart.data.labels = [];
   chart.data.datasets.forEach(x => x.data = []);
   chart.update();
@@ -494,6 +500,17 @@ function updateKpiDisplay(avgFps, low1Fps, peakRamMb, tempC) {
   $('stat-temp').innerHTML  = `<span class="${tempCls}">${fmt(tempC, ' °C')}</span>`;
 }
 
+function showMetricStatus(status = {}) {
+  const state = value => value === 'unsupported' ? 'UNSUPPORTED' : value === 'available' ? 'AVAILABLE' : 'UNAVAILABLE';
+  $('fps-label').textContent = `AVG FPS · ${state(status.fps)}`;
+  $('ram-label').textContent = `PEAK RAM · ${state(status.ram_pss)}`;
+  $('temp-label').textContent = `BATTERY TEMP · ${state(status.battery_temperature)}`;
+  $('chartHint').textContent = `FPS uses the left axis; clocks and memory use the right axis. CPU clock ${state(status.cpu_clock).toLowerCase()}, GPU clock ${state(status.gpu_clock).toLowerCase()}.`;
+  if (status.gpu_clock === 'unsupported') $('gpu').textContent = 'GPU tracking unsupported';
+  else if (status.gpu_clock === 'unavailable') $('gpu').textContent = 'GPU clock reading unavailable';
+  else if (status.gpu_clock === 'available') $('gpu').textContent = 'GPU tracking available';
+}
+
 function sortedPercentile(arr, p) {
   const s = [...arr].sort((a, b) => a - b);
   const k = Math.max(1, Math.ceil(s.length * p));
@@ -503,6 +520,9 @@ function sortedPercentile(arr, p) {
 
 function add(s) {
   samples.push(s);
+  for (const interval of (s.frame_intervals_ms || [])) {
+    if (Number.isFinite(interval) && interval > 0) frameFpsValues.push(1000 / interval);
+  }
   $('empty').classList.add('hidden');
   chart.data.labels.push(samples.length);
   chart.data.datasets[0].data.push(s.fps);
@@ -513,18 +533,31 @@ function add(s) {
 
   const validFps = samples.map(x => x.fps).filter(x => x != null);
   const liveAvg  = validFps.length ? validFps.reduce((a, b) => a + b, 0) / validFps.length : null;
-  const liveLow1 = validFps.length ? sortedPercentile(validFps, 0.01) : null;
+  const liveWindow = frameFpsValues.slice(-1000);
+  const liveLow1 = liveWindow.length >= 100 ? sortedPercentile(liveWindow, 0.01) : null;
+  $('low1-label').title = `Live estimate uses the latest ${liveWindow.length} frame intervals; at least 100 are required. The final session value uses all captured intervals.`;
   const validRam = samples.map(x => x.ram_pss_kb).filter(x => x != null);
   // reduce-based max avoids call-stack overflow on very long sessions
   const peakRam  = validRam.length ? validRam.reduce((m, v) => Math.max(m, v), -Infinity) / 1024 : null;
 
   updateKpiDisplay(liveAvg, liveLow1, peakRam, s.battery_temperature_c);
+  showMetricStatus(s.metric_status);
 }
 
 function result(d) {
   const a = d.aggregates || {};
+  const lowMethod = a.low_fps_method;
+  $('low1-label').textContent = lowMethod === 'frame_intervals'
+    ? '1% LOW · FRAME'
+    : lowMethod === 'sampled_fps_legacy' ? '1% LOW · SAMPLED' : '1% LOW · N/A';
+  $('low1-label').title = lowMethod === 'frame_intervals'
+    ? `Calculated from ${a.frame_interval_count || 0} individual frame intervals.`
+    : lowMethod === 'sampled_fps_legacy'
+      ? 'Estimated from periodic FPS samples in a session recorded by an older version.'
+      : 'Individual frame timing was unavailable for this session.';
   const ram = a.peak_ram_pss_kb == null ? null : a.peak_ram_pss_kb / 1024;
   updateKpiDisplay(a.avg_fps, a.low_1_percent_fps, ram, a.peak_battery_temperature_c);
+  showMetricStatus(a.metric_status);
 
   const r = d.report || {};
   const recs = (r.recommendations || ['Review FPS lows and frame-time variance.'])
